@@ -33,6 +33,7 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/v1/deconvolve` | 解卷积裁决（版本化 JSON 接口） |
+| POST | `/api/v1/deconvolve/coeluting` | 多电荷共流出联合确认（2–4 个电荷态） |
 | GET | `/health` | 健康检查 |
 | GET | `/docs` | OpenAPI 交互文档 |
 
@@ -82,6 +83,51 @@ curl -s http://localhost:8000/api/v1/deconvolve \
 }
 ```
 
+## 多电荷共流出确认 `/api/v1/deconvolve/coeluting`
+
+实验室确认同一化合物的多电荷同位素包络时，普通接口会把"各电荷态分别最优"的峰簇
+误判为同一前体。本接口在**同一个穷举搜索**中要求：
+
+- 请求在原有 `peaks` / `charges` / `tolerance` 之上新增
+  `required_charges`（2–4 个互不重复、且全部属于 `charges` 的正整数）与
+  `mass_tolerance`（≥ 0 的十进制中性质量容差，单位 Da）；
+- 每个指定电荷态**恰好选择一个**峰簇，各簇之间峰互不重叠；
+- 每个簇由**首峰**换算中性质量 `M = z · mz(首峰)`，其闭区间
+  `[M − mass_tolerance, M + mass_tolerance]` 必须有公共交集（边界相切算合法）；
+- 只在满足"共同中性质量 + 指定电荷覆盖"的**完整候选组合**内部，仍依次最大化
+  已解释强度、已解释峰数、最小化簇数（簇数恒为指定电荷数）。搜索是联合进行的，
+  **不会**先跑普通解卷积再筛选。
+
+响应在普通响应基础上：
+
+- 每个簇额外给出由首峰换算的 `neutral_mass`；
+- 顶层与 `second_witness` 各自给出 `common_mass: {lower, upper}`（闭区间，
+  `UNRESOLVED` 时为 `null`）；
+- 裁决语义相同：`UNIQUE`（最优组合唯一）/ `AMBIGUOUS`（附带一份不同的联合
+  见证）/ `UNRESOLVED`（不存在任何完整候选组合）。
+
+`required_charges` 个数非法（<2 或 >4）、重复、含非正整数、不属于 `charges`，
+或 `mass_tolerance` 非法（负数、NaN、缺失）时均返回与现有格式一致的 422
+可定位错误，且不产生裁决。原 `POST /api/v1/deconvolve` 的请求与响应语义保持不变
+（且拒绝 `required_charges` / `mass_tolerance` 等新字段）。
+
+```bash
+curl -s http://localhost:8000/api/v1/deconvolve/coeluting \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "peaks": [
+          {"mz": "500.0000000", "intensity": 100},
+          {"mz": "500.5016775", "intensity": 90},
+          {"mz": "1000.000000", "intensity": 80},
+          {"mz": "1001.003355", "intensity": 70}
+        ],
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0.0001",
+        "mass_tolerance": "0.001"
+      }'
+```
+
 ## 快速开始（Docker）
 
 ```bash
@@ -97,7 +143,8 @@ docker compose run --rm verify
 ```
 
 `verify` 服务对运行中的真实 API 执行全部验收场景（UNIQUE / AMBIGUOUS /
-UNRESOLVED、字典序目标、容差边界、36 峰全量、非法输入 422 等），全部通过时退出码为 0。
+UNRESOLVED、字典序目标、容差边界、36 峰全量、非法输入 422、共流出共同质量边界、
+联合全局取舍、多解见证与旧接口兼容回归等），全部通过时退出码为 0。
 
 ## 本地开发
 

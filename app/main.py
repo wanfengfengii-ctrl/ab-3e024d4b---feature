@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -11,9 +12,15 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .schemas import (
     ClusterOut,
+    CoelutingClusterOut,
+    CoelutingInputSummaryOut,
+    CoelutingRequest,
+    CoelutingResponse,
+    CoelutingSolutionOut,
     DeconvolutionRequest,
     DeconvolutionResponse,
     InputSummaryOut,
+    MassIntervalOut,
     ObjectivesOut,
     PeakOut,
     SolutionOut,
@@ -21,6 +28,8 @@ from .schemas import (
 from .solver import (
     ISOTOPE_SPACING,
     Cluster,
+    CoelutingResult,
+    CoelutingSolver,
     DeconvolutionResult,
     Deconvolver,
     Peak,
@@ -98,6 +107,7 @@ def root() -> dict:
         "version": __version__,
         "endpoints": {
             "deconvolve": "POST /api/v1/deconvolve",
+            "coeluting": "POST /api/v1/deconvolve/coeluting",
             "health": "GET /health",
             "docs": "GET /docs",
         },
@@ -122,6 +132,28 @@ def deconvolve(payload: DeconvolutionRequest) -> DeconvolutionResponse:
         max_search_ops=MAX_SEARCH_OPS,
     ).solve()
     return _build_response(payload, peaks, result)
+
+
+@app.post(
+    "/api/v1/deconvolve/coeluting",
+    response_model=CoelutingResponse,
+    tags=["v1"],
+    summary="Jointly confirm coeluting multi-charge isotope envelopes",
+)
+def deconvolve_coeluting(payload: CoelutingRequest) -> CoelutingResponse:
+    peaks = [
+        Peak(index=i, mz=p.mz, intensity=p.intensity)
+        for i, p in enumerate(payload.peaks)
+    ]
+    result = CoelutingSolver(
+        peaks=peaks,
+        allowed_charges=payload.charges,
+        required_charges=payload.required_charges,
+        tolerance=payload.tolerance,
+        mass_tolerance=payload.mass_tolerance,
+        max_search_ops=MAX_SEARCH_OPS,
+    ).solve()
+    return _build_coeluting_response(payload, peaks, result)
 
 
 def _build_response(
@@ -167,6 +199,82 @@ def _solution_out(clusters: tuple[Cluster, ...], peaks: list[Peak]) -> SolutionO
         )
     unexplained = [_peak_out(p) for p in peaks if p.index not in explained]
     return SolutionOut(clusters=out_clusters, unexplained_peaks=unexplained)
+
+
+def _build_coeluting_response(
+    payload: CoelutingRequest,
+    peaks: list[Peak],
+    result: CoelutingResult,
+) -> CoelutingResponse:
+    primary = _coeluting_solution_out(
+        result.primary, peaks, payload.mass_tolerance
+    )
+    secondary = (
+        _coeluting_solution_out(result.secondary, peaks, payload.mass_tolerance)
+        if result.secondary is not None
+        else None
+    )
+    common_mass = (
+        MassIntervalOut(lower=str(result.mass_lower), upper=str(result.mass_upper))
+        if result.primary
+        else None
+    )
+    return CoelutingResponse(
+        verdict=result.verdict,
+        objectives=ObjectivesOut(
+            explained_intensity=result.explained_intensity,
+            explained_peak_count=result.explained_peak_count,
+            cluster_count=result.cluster_count,
+        ),
+        clusters=primary.clusters,
+        unexplained_peaks=primary.unexplained_peaks,
+        common_mass=common_mass,
+        second_witness=secondary,
+        input_summary=CoelutingInputSummaryOut(
+            peak_count=len(peaks),
+            charges=sorted(set(payload.charges)),
+            required_charges=sorted(payload.required_charges),
+            tolerance=str(payload.tolerance),
+            mass_tolerance=str(payload.mass_tolerance),
+            isotope_spacing=str(ISOTOPE_SPACING),
+        ),
+    )
+
+
+def _coeluting_solution_out(
+    clusters: tuple[Cluster, ...],
+    peaks: list[Peak],
+    mass_tolerance: Decimal,
+) -> CoelutingSolutionOut:
+    explained: set[int] = set()
+    out_clusters: list[CoelutingClusterOut] = []
+    centers: list[Decimal] = []
+    for cluster in clusters:
+        explained.update(cluster.peak_indices)
+        neutral_mass = cluster.charge * peaks[cluster.peak_indices[0]].mz
+        centers.append(neutral_mass)
+        out_clusters.append(
+            CoelutingClusterOut(
+                charge=cluster.charge,
+                peak_indices=list(cluster.peak_indices),
+                explained_intensity=cluster.explained_intensity,
+                peaks=[_peak_out(peaks[i]) for i in cluster.peak_indices],
+                neutral_mass=str(neutral_mass),
+            )
+        )
+    unexplained = [_peak_out(p) for p in peaks if p.index not in explained]
+    if centers:
+        common_mass = MassIntervalOut(
+            lower=str(max(c - mass_tolerance for c in centers)),
+            upper=str(min(c + mass_tolerance for c in centers)),
+        )
+    else:
+        common_mass = MassIntervalOut(lower="0", upper="0")
+    return CoelutingSolutionOut(
+        clusters=out_clusters,
+        unexplained_peaks=unexplained,
+        common_mass=common_mass,
+    )
 
 
 def _peak_out(peak: Peak) -> PeakOut:

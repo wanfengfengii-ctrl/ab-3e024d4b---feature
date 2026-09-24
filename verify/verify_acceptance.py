@@ -18,12 +18,14 @@ from __future__ import annotations
 import os
 import sys
 import time
+from decimal import Decimal
 
 import httpx
 
 BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 HEALTH_URL = f"{BASE_URL}/health"
 DECONVOLVE_URL = f"{BASE_URL}/api/v1/deconvolve"
+COELUTING_URL = f"{BASE_URL}/api/v1/deconvolve/coeluting"
 
 _checks = 0
 _failures: list[str] = []
@@ -54,6 +56,30 @@ def wait_for_api(timeout_s: float = 60.0) -> bool:
 
 def post(client: httpx.Client, payload: dict) -> httpx.Response:
     return client.post(DECONVOLVE_URL, json=payload, timeout=30.0)
+
+
+def post_coeluting(client: httpx.Client, payload: dict) -> httpx.Response:
+    return client.post(COELUTING_URL, json=payload, timeout=30.0)
+
+
+def pair_around(mass: str, charge: int, intensity: int = 100) -> list[dict]:
+    """Two-peak isotope envelope at charge ``charge`` around neutral mass."""
+    m0 = Decimal(mass) / charge
+    return [
+        {"mz": str(m0), "intensity": intensity},
+        {"mz": str(m0 + Decimal("1.003355") / charge), "intensity": intensity},
+    ]
+
+
+def merge_pairs(*pairs: list[dict]) -> list[dict]:
+    by_mz: dict[str, int] = {}
+    for pair in pairs:
+        for p in pair:
+            by_mz[p["mz"]] = by_mz.get(p["mz"], 0) + p["intensity"]
+    return [
+        {"mz": mz, "intensity": it}
+        for mz, it in sorted(by_mz.items(), key=lambda kv: Decimal(kv[0]))
+    ]
 
 
 def cluster_index_sets(solution_clusters: list[dict]) -> set[tuple[int, ...]]:
@@ -396,6 +422,326 @@ def scenario_validation(client: httpx.Client) -> None:
 # ---------------------------------------------------------------------- #
 
 
+def scenario_coeluting_unique(client: httpx.Client) -> None:
+    print("[coeluting: joint multi-charge confirmation]")
+    payload = {
+        "peaks": merge_pairs(pair_around("1000", 1), pair_around("1000", 2)),
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0.0001",
+        "mass_tolerance": "0.001",
+    }
+    resp = post_coeluting(client, payload)
+    check("coeluting: 200", resp.status_code == 200, f"got {resp.status_code}: {resp.text}")
+    body = resp.json()
+    check("coeluting: verdict UNIQUE", body.get("verdict") == "UNIQUE", body.get("verdict", ""))
+    obj = body.get("objectives", {})
+    check(
+        "coeluting: objectives (400 / 4 / 2)",
+        (obj.get("explained_intensity"), obj.get("explained_peak_count"), obj.get("cluster_count"))
+        == (400, 4, 2),
+        repr(obj),
+    )
+    clusters = body.get("clusters", [])
+    check(
+        "coeluting: exactly one cluster per required charge",
+        sorted(c.get("charge") for c in clusters) == [1, 2],
+        repr([(c.get("charge"), c.get("peak_indices")) for c in clusters]),
+    )
+    check(
+        "coeluting: clusters are mutually disjoint",
+        (lambda idx: len(idx) == len(set(idx)) == 4)(
+            [i for c in clusters for i in c.get("peak_indices", [])]
+        ),
+    )
+    check(
+        "coeluting: common mass interval is the [999.999, 1000.001] intersection",
+        body.get("common_mass") == {"lower": "999.999", "upper": "1000.001"},
+        repr(body.get("common_mass")),
+    )
+    check("coeluting: no second witness", body.get("second_witness") is None)
+    summary = body.get("input_summary", {})
+    check(
+        "coeluting: input summary carries required charges and mass tolerance",
+        summary.get("required_charges") == [1, 2]
+        and summary.get("mass_tolerance") == "0.001"
+        and summary.get("isotope_spacing") == "1.003355",
+        repr(summary),
+    )
+    # Deterministic byte-identical responses.
+    bodies = {post_coeluting(client, payload).text for _ in range(3)}
+    check("coeluting: responses are byte-identical", len(bodies) == 1)
+
+
+def scenario_coeluting_mass_boundary(client: httpx.Client) -> None:
+    print("[coeluting: common neutral-mass boundary]")
+    # z=1 envelope first peak => M=1000.0010; z=2 first peak => M=1000.0000.
+    peaks = merge_pairs(
+        pair_around("1000.0010", 1),
+        [
+            {"mz": "500.0000", "intensity": 100},
+            {"mz": "500.5016775", "intensity": 100},
+        ],
+    )
+    base = {
+        "peaks": peaks,
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0.0001",
+    }
+    resp = post_coeluting(client, {**base, "mass_tolerance": "0.0005"})
+    body = resp.json()
+    check(
+        "boundary: intervals touching at one mass are accepted",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and body.get("common_mass") == {"lower": "1000.0005", "upper": "1000.0005"},
+        resp.text[:300],
+    )
+    resp = post_coeluting(client, {**base, "mass_tolerance": "0.000499"})
+    body = resp.json()
+    check(
+        "boundary: disjoint intervals yield UNRESOLVED with no common mass",
+        resp.status_code == 200
+        and body.get("verdict") == "UNRESOLVED"
+        and body.get("clusters") == []
+        and body.get("common_mass") is None
+        and body.get("second_witness") is None,
+        resp.text[:300],
+    )
+
+
+def scenario_coeluting_global_tradeoff(client: httpx.Client) -> None:
+    print("[coeluting: global tradeoff vs per-charge optimum]")
+    # Strongest z=1 envelope lives at M=900; strongest z=2 at M=1000.  Chosen
+    # independently they are incompatible (mass intervals disjoint), which is
+    # exactly the mis-merge this endpoint must prevent.  The joint optimum
+    # pairs the strong z=2 envelope with a weak z=1 envelope at M=1000.0005.
+    peaks = merge_pairs(
+        [{"mz": "500.0000", "intensity": 1000}, {"mz": "500.5016775", "intensity": 1000}],
+        [{"mz": "900.0000", "intensity": 1000}, {"mz": "901.003355", "intensity": 1000}],
+        [{"mz": "1000.0005", "intensity": 10}, {"mz": "1001.003855", "intensity": 10}],
+    )
+    payload = {
+        "peaks": peaks,
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0.0001",
+        "mass_tolerance": "1",
+    }
+    resp = post_coeluting(client, payload)
+    body = resp.json()
+    chosen = {c.get("charge"): tuple(c.get("peak_indices")) for c in body.get("clusters", [])}
+    check(
+        "tradeoff: joint optimum sacrifices the per-charge strongest envelopes (2020)",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and body.get("objectives", {}).get("explained_intensity") == 2020
+        and chosen == {2: (0, 1), 1: (4, 5)},
+        f"{resp.text[:300]} chosen={chosen}",
+    )
+    # The compromise centres differ by 0.0005 Da; a tight tolerance excludes it.
+    resp = post_coeluting(client, {**payload, "mass_tolerance": "0.0001"})
+    check(
+        "tradeoff: tight mass tolerance is UNRESOLVED",
+        resp.status_code == 200 and resp.json().get("verdict") == "UNRESOLVED",
+        resp.text[:300],
+    )
+
+
+def scenario_coeluting_overlap_rejected(client: httpx.Client) -> None:
+    print("[coeluting: peak-sharing clusters are never merged]")
+    # One pair that is legal at both charges (wide tolerance); two disjoint
+    # per-charge clusters cannot exist on just two peaks.
+    payload = {
+        "peaks": [
+            {"mz": "500.0000", "intensity": 10},
+            {"mz": "500.5016775", "intensity": 10},
+        ],
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0.6",
+        "mass_tolerance": "300",
+    }
+    resp = post_coeluting(client, payload)
+    check(
+        "overlap: sharing peaks is rejected even with a huge mass tolerance",
+        resp.status_code == 200 and resp.json().get("verdict") == "UNRESOLVED",
+        resp.text[:300],
+    )
+
+
+def scenario_coeluting_ambiguous(client: httpx.Client) -> None:
+    print("[coeluting: multiple optimal joint candidates]")
+    peaks = merge_pairs(
+        [{"mz": "500.0000", "intensity": 100}, {"mz": "500.5016775", "intensity": 100}],
+        [{"mz": "500.0005", "intensity": 100}, {"mz": "500.5021775", "intensity": 100}],
+        pair_around("1000", 1),
+    )
+    payload = {
+        "peaks": peaks,
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0.0001",
+        "mass_tolerance": "0.001",
+    }
+    resp = post_coeluting(client, payload)
+    body = resp.json()
+    witness = body.get("second_witness")
+    primary_z2 = {
+        tuple(c["peak_indices"]) for c in body.get("clusters", []) if c["charge"] == 2
+    }
+    witness_z2 = (
+        {tuple(c["peak_indices"]) for c in witness.get("clusters", []) if c["charge"] == 2}
+        if witness
+        else set()
+    )
+    check(
+        "ambiguous: AMBIGUOUS with a distinct joint witness {(0,2)} vs {(1,3)}",
+        resp.status_code == 200
+        and body.get("verdict") == "AMBIGUOUS"
+        and witness is not None
+        and primary_z2 != witness_z2
+        and primary_z2 | witness_z2 == {(0, 2), (1, 3)},
+        resp.text[:400],
+    )
+    if witness:
+        w_intensity = sum(c["explained_intensity"] for c in witness["clusters"])
+        check(
+            "ambiguous: witness matches primary objectives",
+            w_intensity == body["objectives"]["explained_intensity"]
+            and len(witness["clusters"]) == body["objectives"]["cluster_count"],
+        )
+        common = witness.get("common_mass", {})
+        check(
+            "ambiguous: witness carries its own valid common mass interval",
+            Decimal(common.get("lower", "NaN")) <= Decimal(common.get("upper", "NaN")),
+            repr(common),
+        )
+
+
+def scenario_coeluting_three_charges(client: httpx.Client) -> None:
+    print("[coeluting: three charge states, unsorted request order]")
+    mass = Decimal("2000")
+    raw: list[tuple[Decimal, int]] = []
+    for z in (1, 2, 3):
+        raw.append((mass / z, z))
+        raw.append((mass / z + Decimal("1.003355") / z, z))
+    raw.sort()
+    payload = {
+        "peaks": [{"mz": str(m), "intensity": z} for m, z in raw],
+        "charges": [1, 2, 3],
+        "required_charges": [3, 1, 2],
+        "tolerance": "0.0000001",
+        "mass_tolerance": "0.000001",
+    }
+    resp = post_coeluting(client, payload)
+    body = resp.json()
+    check(
+        "three charges: UNIQUE, one disjoint cluster per charge",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and sorted(c["charge"] for c in body.get("clusters", [])) == [1, 2, 3]
+        and body.get("input_summary", {}).get("required_charges") == [1, 2, 3],
+        resp.text[:300],
+    )
+
+
+def scenario_coeluting_validation(client: httpx.Client) -> None:
+    print("[coeluting: validation 422, never a verdict]")
+    good = {
+        "peaks": merge_pairs(pair_around("1000", 1), pair_around("1000", 2)),
+        "charges": [1, 2],
+        "required_charges": [1, 2],
+        "tolerance": "0.0001",
+        "mass_tolerance": "0.001",
+    }
+    cases = {
+        "too few required charges": {**good, "required_charges": [1]},
+        "too many required charges": {
+            **good,
+            "charges": [1, 2, 3, 4, 5],
+            "required_charges": [1, 2, 3, 4, 5],
+        },
+        "duplicate required charges": {**good, "required_charges": [1, 1]},
+        "required charge outside charges": {
+            **good,
+            "charges": [1],
+            "required_charges": [1, 2],
+        },
+        "zero required charge": {
+            **good,
+            "charges": [0, 1],
+            "required_charges": [0, 1],
+        },
+        "negative mass tolerance": {**good, "mass_tolerance": "-0.001"},
+        "NaN mass tolerance": {**good, "mass_tolerance": "NaN"},
+        "missing mass tolerance": {k: v for k, v in good.items() if k != "mass_tolerance"},
+        "missing required charges": {
+            k: v for k, v in good.items() if k != "required_charges"
+        },
+        "unknown field": {**good, "debug": True},
+    }
+    for name, payload in cases.items():
+        resp = post_coeluting(client, payload)
+        ok_status = resp.status_code == 422
+        body = resp.json() if ok_status else {}
+        fields = body.get("error", {}).get("fields", [])
+        located = all(f.get("loc") for f in fields) and len(fields) > 0
+        check(
+            f"coeluting validation[{name}]: 422 located, no verdict",
+            ok_status and located and "verdict" not in body,
+            f"status={resp.status_code} body={resp.text[:300]}",
+        )
+
+
+def scenario_legacy_compatibility(client: httpx.Client) -> None:
+    print("[compatibility: legacy POST /api/v1/deconvolve unchanged]")
+    payload = {
+        "peaks": [
+            {"mz": "400.000000", "intensity": 500},
+            {"mz": "500.000000", "intensity": 1000},
+            {"mz": "501.003355", "intensity": 800},
+            {"mz": "502.006710", "intensity": 600},
+            {"mz": "503.010065", "intensity": 400},
+            {"mz": "700.000000", "intensity": 50},
+        ],
+        "charges": [1],
+        "tolerance": "0.0005",
+    }
+    resp = post(client, payload)
+    body = resp.json() if resp.status_code == 200 else {}
+    check(
+        "legacy: shape and semantics preserved",
+        resp.status_code == 200
+        and set(body) == {
+            "verdict",
+            "objectives",
+            "clusters",
+            "unexplained_peaks",
+            "second_witness",
+            "input_summary",
+        }
+        and body.get("verdict") == "UNIQUE"
+        and body.get("objectives") == {
+            "explained_intensity": 2800,
+            "explained_peak_count": 4,
+            "cluster_count": 1,
+        }
+        and "common_mass" not in body
+        and "neutral_mass" not in body.get("clusters", [{}])[0]
+        and set(body.get("input_summary", {}))
+        == {"peak_count", "charges", "tolerance", "isotope_spacing"},
+        resp.text[:400],
+    )
+    # Coeluting-only fields must not be accepted on the legacy endpoint.
+    resp = post(client, {**payload, "required_charges": [1, 2], "mass_tolerance": "1"})
+    check("legacy: coeluting-only fields rejected", resp.status_code == 422, resp.text[:200])
+
+
+# ---------------------------------------------------------------------- #
+
+
 def main() -> int:
     print(f"Acceptance target: {BASE_URL}")
     if not wait_for_api():
@@ -413,6 +759,16 @@ def main() -> int:
         scenario_cluster_size_cap(client)
         scenario_full_scale(client)
         scenario_validation(client)
+        # Coeluting multi-charge confirmation (new endpoint).
+        scenario_coeluting_unique(client)
+        scenario_coeluting_mass_boundary(client)
+        scenario_coeluting_global_tradeoff(client)
+        scenario_coeluting_overlap_rejected(client)
+        scenario_coeluting_ambiguous(client)
+        scenario_coeluting_three_charges(client)
+        scenario_coeluting_validation(client)
+        # Legacy endpoint regression.
+        scenario_legacy_compatibility(client)
     print(f"\n{_checks - len(_failures)}/{_checks} checks passed")
     if _failures:
         print("FAILED checks:")
