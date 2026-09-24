@@ -1,4 +1,4 @@
-"""FastAPI application exposing the versioned deconvolution endpoint."""
+"""FastAPI application exposing the versioned deconvolution endpoints."""
 
 from __future__ import annotations
 
@@ -11,9 +11,14 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .schemas import (
     ClusterOut,
+    CoelutingInputSummaryOut,
+    CoelutingRequest,
+    CoelutingResponse,
+    CoelutingSolutionOut,
     DeconvolutionRequest,
     DeconvolutionResponse,
     InputSummaryOut,
+    MassIntervalOut,
     ObjectivesOut,
     PeakOut,
     SolutionOut,
@@ -21,6 +26,8 @@ from .schemas import (
 from .solver import (
     ISOTOPE_SPACING,
     Cluster,
+    CoelutingDeconvolver,
+    CoelutingResult,
     DeconvolutionResult,
     Deconvolver,
     Peak,
@@ -98,6 +105,7 @@ def root() -> dict:
         "version": __version__,
         "endpoints": {
             "deconvolve": "POST /api/v1/deconvolve",
+            "coeluting_deconvolve": "POST /api/v1/deconvolve/coeluting",
             "health": "GET /health",
             "docs": "GET /docs",
         },
@@ -153,6 +161,13 @@ def _build_response(
 
 
 def _solution_out(clusters: tuple[Cluster, ...], peaks: list[Peak]) -> SolutionOut:
+    out_clusters, unexplained = _clusters_and_unexplained(clusters, peaks)
+    return SolutionOut(clusters=out_clusters, unexplained_peaks=unexplained)
+
+
+def _clusters_and_unexplained(
+    clusters: tuple[Cluster, ...], peaks: list[Peak]
+) -> tuple[list[ClusterOut], list[PeakOut]]:
     explained: set[int] = set()
     out_clusters: list[ClusterOut] = []
     for cluster in clusters:
@@ -166,8 +181,74 @@ def _solution_out(clusters: tuple[Cluster, ...], peaks: list[Peak]) -> SolutionO
             )
         )
     unexplained = [_peak_out(p) for p in peaks if p.index not in explained]
-    return SolutionOut(clusters=out_clusters, unexplained_peaks=unexplained)
+    return out_clusters, unexplained
 
 
 def _peak_out(peak: Peak) -> PeakOut:
     return PeakOut(index=peak.index, mz=str(peak.mz), intensity=peak.intensity)
+
+
+@app.post(
+    "/api/v1/deconvolve/coeluting",
+    response_model=CoelutingResponse,
+    tags=["v1"],
+    summary="Confirm a co-eluting multi-charge envelope of one precursor",
+)
+def deconvolve_coeluting(payload: CoelutingRequest) -> CoelutingResponse:
+    peaks = [
+        Peak(index=i, mz=p.mz, intensity=p.intensity)
+        for i, p in enumerate(payload.peaks)
+    ]
+    result = CoelutingDeconvolver(
+        peaks=peaks,
+        charges=payload.charges,
+        tolerance=payload.tolerance,
+        required_charges=payload.required_charges,
+        mass_tolerance=payload.mass_tolerance,
+        max_search_ops=MAX_SEARCH_OPS,
+    ).solve()
+    return _build_coeluting_response(payload, peaks, result)
+
+
+def _build_coeluting_response(
+    payload: CoelutingRequest,
+    peaks: list[Peak],
+    result: CoelutingResult,
+) -> CoelutingResponse:
+    clusters, unexplained = _clusters_and_unexplained(result.primary, peaks)
+    interval = _mass_interval_out(result.primary_mass_interval)
+    secondary = None
+    if result.secondary is not None:
+        s_clusters, s_unexplained = _clusters_and_unexplained(result.secondary, peaks)
+        secondary = CoelutingSolutionOut(
+            clusters=s_clusters,
+            common_mass_interval=_mass_interval_out(result.secondary_mass_interval),
+            unexplained_peaks=s_unexplained,
+        )
+    return CoelutingResponse(
+        verdict=result.verdict,
+        objectives=ObjectivesOut(
+            explained_intensity=result.explained_intensity,
+            explained_peak_count=result.explained_peak_count,
+            cluster_count=result.cluster_count,
+        ),
+        clusters=clusters,
+        common_mass_interval=interval,
+        unexplained_peaks=unexplained,
+        second_witness=secondary,
+        input_summary=CoelutingInputSummaryOut(
+            peak_count=len(peaks),
+            charges=sorted(set(payload.charges)),
+            required_charges=sorted(set(payload.required_charges)),
+            tolerance=str(payload.tolerance),
+            mass_tolerance=str(payload.mass_tolerance),
+            isotope_spacing=str(ISOTOPE_SPACING),
+        ),
+    )
+
+
+def _mass_interval_out(interval: tuple | None) -> MassIntervalOut | None:
+    if interval is None:
+        return None
+    lower, upper = interval
+    return MassIntervalOut(lower=str(lower), upper=str(upper))

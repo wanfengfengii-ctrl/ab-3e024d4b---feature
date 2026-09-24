@@ -24,6 +24,7 @@ import httpx
 BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 HEALTH_URL = f"{BASE_URL}/health"
 DECONVOLVE_URL = f"{BASE_URL}/api/v1/deconvolve"
+COELUTING_URL = f"{BASE_URL}/api/v1/deconvolve/coeluting"
 
 _checks = 0
 _failures: list[str] = []
@@ -54,6 +55,10 @@ def wait_for_api(timeout_s: float = 60.0) -> bool:
 
 def post(client: httpx.Client, payload: dict) -> httpx.Response:
     return client.post(DECONVOLVE_URL, json=payload, timeout=30.0)
+
+
+def post_coeluting(client: httpx.Client, payload: dict) -> httpx.Response:
+    return client.post(COELUTING_URL, json=payload, timeout=30.0)
 
 
 def cluster_index_sets(solution_clusters: list[dict]) -> set[tuple[int, ...]]:
@@ -394,6 +399,305 @@ def scenario_validation(client: httpx.Client) -> None:
 
 
 # ---------------------------------------------------------------------- #
+# Co-eluting multi-charge confirmation scenarios
+# ---------------------------------------------------------------------- #
+
+# A single precursor of neutral mass 500 observed at z=1 and z=2.
+COELUTING_UNIQUE_PEAKS = [
+    {"mz": "250.000000", "intensity": 400},
+    {"mz": "250.5016775", "intensity": 300},
+    {"mz": "500.000000", "intensity": 1000},
+    {"mz": "501.003355", "intensity": 800},
+]
+
+# The strong z=1 envelope (mass 500) is mass-inconsistent with the only z=2
+# envelope (mass 600); the feasible optimum must trade intensity for a common
+# neutral mass and pick the weak z=1 envelope at mass 600.
+COELUTING_TRADEOFF_PEAKS = [
+    {"mz": "300.000000", "intensity": 500},
+    {"mz": "300.5016775", "intensity": 400},
+    {"mz": "500.000000", "intensity": 1000},
+    {"mz": "501.003355", "intensity": 800},
+    {"mz": "600.000000", "intensity": 100},
+    {"mz": "601.003355", "intensity": 90},
+]
+
+# Two equal-quality z=1 envelopes (mass 600 and 602) both fit the z=2
+# envelope (mass 600) within mass_tolerance 1.0.
+COELUTING_AMBIGUOUS_PEAKS = [
+    {"mz": "300.000000", "intensity": 10},
+    {"mz": "300.5016775", "intensity": 10},
+    {"mz": "600.000000", "intensity": 100},
+    {"mz": "601.003355", "intensity": 100},
+    {"mz": "602.000000", "intensity": 100},
+    {"mz": "603.003355", "intensity": 100},
+]
+
+
+def scenario_coeluting_unique(client: httpx.Client) -> None:
+    print("[coeluting: unique two-charge envelope]")
+    payload = {
+        "peaks": COELUTING_UNIQUE_PEAKS,
+        "charges": [1, 2],
+        "tolerance": "0.0001",
+        "required_charges": [1, 2],
+        "mass_tolerance": "0.5",
+    }
+    resp = post_coeluting(client, payload)
+    check("coeluting unique: 200", resp.status_code == 200, f"got {resp.status_code}: {resp.text}")
+    body = resp.json()
+    check("coeluting unique: verdict UNIQUE", body.get("verdict") == "UNIQUE", body.get("verdict", ""))
+    obj = body.get("objectives", {})
+    check(
+        "coeluting unique: objectives (2500 / 4 / 2)",
+        (obj.get("explained_intensity"), obj.get("explained_peak_count"), obj.get("cluster_count"))
+        == (2500, 4, 2),
+        repr(obj),
+    )
+    clusters = body.get("clusters", [])
+    check(
+        "coeluting unique: canonical clusters z=2 [0,1] then z=1 [2,3]",
+        [(c.get("charge"), c.get("peak_indices")) for c in clusters] == [(2, [0, 1]), (1, [2, 3])],
+        repr(clusters),
+    )
+    check(
+        "coeluting unique: common mass interval [499.5, 500.5]",
+        body.get("common_mass_interval") == {"lower": "499.500000", "upper": "500.500000"},
+        repr(body.get("common_mass_interval")),
+    )
+    check("coeluting unique: no unexplained peaks", body.get("unexplained_peaks") == [])
+    check("coeluting unique: no second witness", body.get("second_witness") is None)
+    summary = body.get("input_summary", {})
+    check(
+        "coeluting unique: input summary echoes required charges and mass tolerance",
+        summary.get("required_charges") == [1, 2] and summary.get("mass_tolerance") == "0.5",
+        repr(summary),
+    )
+
+
+def scenario_coeluting_mass_boundary(client: httpx.Client) -> None:
+    print("[coeluting: common-mass boundary is inclusive]")
+    # Neutral-mass estimates 500.4 (z=2) and 500.0 (z=1): spread exactly 0.4.
+    base = {
+        "peaks": [
+            {"mz": "250.200000", "intensity": 10},
+            {"mz": "250.7016775", "intensity": 20},
+            {"mz": "500.000000", "intensity": 30},
+            {"mz": "501.003355", "intensity": 40},
+        ],
+        "charges": [1, 2],
+        "tolerance": "0.0001",
+        "required_charges": [1, 2],
+    }
+    resp = post_coeluting(client, {**base, "mass_tolerance": "0.2"})
+    body = resp.json()
+    check(
+        "coeluting boundary: spread == 2*mass_tolerance is accepted (degenerate interval)",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and body.get("common_mass_interval") == {"lower": "500.200000", "upper": "500.200000"},
+        resp.text,
+    )
+    resp = post_coeluting(client, {**base, "mass_tolerance": "0.1999"})
+    check(
+        "coeluting boundary: spread > 2*mass_tolerance is UNRESOLVED",
+        resp.status_code == 200 and resp.json().get("verdict") == "UNRESOLVED",
+        resp.text,
+    )
+
+
+def scenario_coeluting_global_tradeoff(client: httpx.Client) -> None:
+    print("[coeluting: global trade-off beats per-charge optimum]")
+    payload = {"peaks": COELUTING_TRADEOFF_PEAKS, "charges": [1, 2], "tolerance": "0.0001"}
+    resp = post_coeluting(client, {**payload, "required_charges": [1, 2], "mass_tolerance": "0.3"})
+    body = resp.json()
+    obj = body.get("objectives", {})
+    check(
+        "coeluting tradeoff: feasible optimum (1090 / 4 / 2), not the mass-inconsistent 2890",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and (obj.get("explained_intensity"), obj.get("explained_peak_count"), obj.get("cluster_count"))
+        == (1090, 4, 2)
+        and [(c.get("charge"), c.get("peak_indices")) for c in body.get("clusters", [])]
+        == [(2, [0, 1]), (1, [4, 5])],
+        resp.text,
+    )
+    # Compatibility regression: the plain endpoint on the same peaks is
+    # unaffected and still returns its unconstrained optimum.
+    resp = post(client, payload)
+    obj = resp.json().get("objectives", {})
+    check(
+        "coeluting tradeoff: plain endpoint unchanged (2890 / 6 / 3 on same peaks)",
+        resp.status_code == 200
+        and (obj.get("explained_intensity"), obj.get("explained_peak_count"), obj.get("cluster_count"))
+        == (2890, 6, 3),
+        resp.text,
+    )
+
+
+def scenario_coeluting_ambiguous(client: httpx.Client) -> None:
+    print("[coeluting: ambiguous verdict + distinct witness]")
+    payload = {
+        "peaks": COELUTING_AMBIGUOUS_PEAKS,
+        "charges": [1, 2],
+        "tolerance": "0.0001",
+        "required_charges": [1, 2],
+        "mass_tolerance": "1.0",
+    }
+    resp = post_coeluting(client, payload)
+    check("coeluting ambiguous: 200", resp.status_code == 200, f"got {resp.status_code}: {resp.text}")
+    body = resp.json()
+    check(
+        "coeluting ambiguous: verdict AMBIGUOUS",
+        body.get("verdict") == "AMBIGUOUS",
+        body.get("verdict", ""),
+    )
+    witness = body.get("second_witness")
+    check("coeluting ambiguous: second witness present", witness is not None)
+    if witness:
+        primary_sets = cluster_index_sets(body.get("clusters", []))
+        witness_sets = cluster_index_sets(witness.get("clusters", []))
+        check(
+            "coeluting ambiguous: witness differs from primary",
+            primary_sets != witness_sets,
+            f"primary={primary_sets} witness={witness_sets}",
+        )
+        check(
+            "coeluting ambiguous: witnesses are {(0,1),(2,3)} and {(0,1),(4,5)}",
+            primary_sets | witness_sets == {(0, 1), (2, 3), (4, 5)},
+            f"primary={primary_sets} witness={witness_sets}",
+        )
+        check(
+            "coeluting ambiguous: witness carries its own common mass interval",
+            witness.get("common_mass_interval") == {"lower": "601.000000", "upper": "601.000000"},
+            repr(witness.get("common_mass_interval")),
+        )
+        w_intensity = sum(c["explained_intensity"] for c in witness.get("clusters", []))
+        check(
+            "coeluting ambiguous: witness matches primary objectives",
+            w_intensity == body.get("objectives", {}).get("explained_intensity")
+            and len(witness.get("clusters", [])) == body.get("objectives", {}).get("cluster_count"),
+            f"witness_intensity={w_intensity}",
+        )
+
+
+def scenario_coeluting_unresolved(client: httpx.Client) -> None:
+    print("[coeluting: unresolved when masses cannot intersect]")
+    payload = {
+        "peaks": [
+            {"mz": "250.000000", "intensity": 10},
+            {"mz": "250.5016775", "intensity": 10},
+            {"mz": "510.000000", "intensity": 10},
+            {"mz": "511.003355", "intensity": 10},
+        ],
+        "charges": [1, 2],
+        "tolerance": "0.0001",
+        "required_charges": [1, 2],
+        "mass_tolerance": "0.1",
+    }
+    resp = post_coeluting(client, payload)
+    body = resp.json()
+    check(
+        "coeluting unresolved: verdict UNRESOLVED with empty clusters and null interval",
+        resp.status_code == 200
+        and body.get("verdict") == "UNRESOLVED"
+        and body.get("clusters") == []
+        and body.get("common_mass_interval") is None
+        and body.get("second_witness") is None,
+        resp.text,
+    )
+    check(
+        "coeluting unresolved: all peaks unexplained",
+        [p["index"] for p in body.get("unexplained_peaks", [])] == [0, 1, 2, 3],
+    )
+
+
+def scenario_coeluting_three_charges(client: httpx.Client) -> None:
+    print("[coeluting: three charge states]")
+    payload = {
+        "peaks": [
+            {"mz": "200.000000", "intensity": 5},
+            {"mz": "200.3344517", "intensity": 5},
+            {"mz": "300.000000", "intensity": 7},
+            {"mz": "300.5016775", "intensity": 6},
+            {"mz": "600.000000", "intensity": 11},
+            {"mz": "601.003355", "intensity": 10},
+        ],
+        "charges": [1, 2, 3],
+        "tolerance": "0.000001",
+        "required_charges": [1, 2, 3],
+        "mass_tolerance": "0.5",
+    }
+    resp = post_coeluting(client, payload)
+    body = resp.json()
+    obj = body.get("objectives", {})
+    check(
+        "coeluting 3-charge: UNIQUE, 3 clusters, everything explained",
+        resp.status_code == 200
+        and body.get("verdict") == "UNIQUE"
+        and (obj.get("explained_intensity"), obj.get("explained_peak_count"), obj.get("cluster_count"))
+        == (44, 6, 3)
+        and [c.get("charge") for c in body.get("clusters", [])] == [3, 2, 1]
+        and body.get("common_mass_interval") == {"lower": "599.500000", "upper": "600.500000"},
+        resp.text,
+    )
+
+
+def scenario_coeluting_validation(client: httpx.Client) -> None:
+    print("[coeluting validation: field-locatable 422, never a verdict]")
+    good = {
+        "peaks": COELUTING_UNIQUE_PEAKS,
+        "charges": [1, 2],
+        "tolerance": "0.0001",
+        "required_charges": [1, 2],
+        "mass_tolerance": "0.5",
+    }
+    cases = {
+        "required charge missing": {k: v for k, v in good.items() if k != "required_charges"},
+        "mass tolerance missing": {k: v for k, v in good.items() if k != "mass_tolerance"},
+        "too few required charges": {**good, "required_charges": [1]},
+        "too many required charges": {
+            **good,
+            "charges": [1, 2, 3, 4, 5],
+            "required_charges": [1, 2, 3, 4, 5],
+        },
+        "duplicate required charges": {**good, "required_charges": [1, 1]},
+        "required charge not allowed": {**good, "required_charges": [1, 3]},
+        "non-positive required charge": {**good, "required_charges": [0, 1]},
+        "fractional required charge": {**good, "required_charges": [1.5, 2]},
+        "negative mass tolerance": {**good, "mass_tolerance": "-0.1"},
+        "unknown field": {**good, "debug": True},
+    }
+    for name, payload in cases.items():
+        resp = post_coeluting(client, payload)
+        ok_status = resp.status_code == 422
+        body = resp.json() if ok_status else {}
+        fields = body.get("error", {}).get("fields", [])
+        located = all(f.get("loc") for f in fields) and len(fields) > 0
+        check(
+            f"coeluting validation[{name}]: 422 with located fields, no verdict",
+            ok_status and located and "verdict" not in body,
+            f"status={resp.status_code} body={resp.text[:300]}",
+        )
+    # Compatibility regression: the legacy schema must not accept the new
+    # co-eluting-only fields.
+    resp = post(
+        client,
+        {
+            "peaks": COELUTING_UNIQUE_PEAKS,
+            "charges": [1, 2],
+            "tolerance": "0.0001",
+            "required_charges": [1, 2],
+        },
+    )
+    check(
+        "compat: plain deconvolve still rejects co-eluting-only fields with 422",
+        resp.status_code == 422 and "verdict" not in resp.json(),
+        f"status={resp.status_code} body={resp.text[:300]}",
+    )
+
+
+# ---------------------------------------------------------------------- #
 
 
 def main() -> int:
@@ -413,6 +717,13 @@ def main() -> int:
         scenario_cluster_size_cap(client)
         scenario_full_scale(client)
         scenario_validation(client)
+        scenario_coeluting_unique(client)
+        scenario_coeluting_mass_boundary(client)
+        scenario_coeluting_global_tradeoff(client)
+        scenario_coeluting_ambiguous(client)
+        scenario_coeluting_unresolved(client)
+        scenario_coeluting_three_charges(client)
+        scenario_coeluting_validation(client)
     print(f"\n{_checks - len(_failures)}/{_checks} checks passed")
     if _failures:
         print("FAILED checks:")
